@@ -1,0 +1,102 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+
+import json
+import os
+import pickle
+import sys
+import traceback
+
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+
+# Important path for sagemaker
+prefix = '/opt/ml/'
+
+input_path = prefix + 'input/data'
+output_path = os.path.join(prefix, 'output')
+model_path = os.path.join(prefix, 'model')
+param_path = os.path.join(prefix, 'input/config/hyperparameters.json')
+
+# Defining training channel
+training_channel_name = 'training'
+training_path = os.path.join(input_path, training_channel_name)
+
+validation_channel_name = 'validation'
+validation_path = os.path.join(input_path, validation_channel_name)
+
+
+# The function to execute the training.
+def train():
+    print('[INFO] Starting the training.....')
+    try:
+        # Read in any hyperparameters that the user passed with the training job
+        with open(param_path, 'r') as tc:
+            trainingParams = json.load(tc)
+        print("[INFO] Hyperparameters: ", trainingParams)
+        # Take the set of files and read them all into a single pandas dataframe
+        train_input_files = [os.path.join(training_path, file) for file in os.listdir(training_path)]
+        if len(train_input_files) == 0:
+            raise ValueError(('There are no files in {}.\n' +
+                              'This usually indicates that the channel ({}) was incorrectly specified,\n' +
+                              'the data specification in S3 was incorrectly specified or the role specified\n' +
+                              'does not have permission to access the data.').format(training_path, training_channel_name))
+        print("[INFO] Found following training files: ", train_input_files)
+        raw_data = [pd.read_csv(file, header=None) for file in train_input_files if file.endswith(".csv")]
+        train_data = pd.concat(raw_data)
+
+        valid_input_files = [os.path.join(validation_path, file) for file in os.listdir(validation_path)]
+        if len(valid_input_files) == 0:
+            raise ValueError(('There are no files in {}.\n' +
+                              'This usually indicates that the channel ({}) was incorrectly specified,\n' +
+                              'the data specification in S3 was incorrectly specified or the role specified\n' +
+                              'does not have permission to access the data.').format(validation_path, validation_channel_name))
+        print("[INFO] Found following training files: ", valid_input_files)
+        raw_data = [pd.read_csv(file, header=None) for file in valid_input_files if file.endswith(".csv")]
+        valid_data = pd.concat(raw_data)
+
+        # labels are in the first column
+        train_y = train_data.iloc[:, 0]
+        train_X = train_data.iloc[:, 1:]
+
+        valid_y = valid_data.iloc[:, 0]
+        valid_X = valid_data.iloc[:, 1:]
+
+        n_estimators = int(trainingParams.get('n_estimators',2))
+        random_state = int(trainingParams.get('random_state', 42))
+
+        # Now use scikit-learn's random forest classifier to train the model.
+        clf =  RandomForestClassifier(n_estimators=n_estimators, random_state=random_state, verbose = 1, n_jobs=-1)
+        clf = clf.fit(train_X, train_y)
+
+        train_y_pred = clf.predict(train_X)
+        training_merror = (train_y != train_y_pred).sum() / len(train_y_pred)
+
+        valid_y_pred = clf.predict(valid_X)
+        validation_merror = (valid_y != valid_y_pred).sum() / len(valid_y_pred)
+
+        print(f"training_merror: {training_merror};")
+        # print(f"validation_merror: {validation_merror};")
+    
+        # save the model
+        with open(os.path.join(model_path, 'random-forest-model.pkl'), 'wb') as out:
+            pickle.dump(clf, out)
+        print('[INFO] Training complete.')
+        print(f'[INFO] Model saved at: {model_path}.')
+    except Exception as e:
+
+        trc = traceback.format_exc()
+        with open(os.path.join(output_path, 'failure'), 'w') as s:
+            s.write('[INFO] Exception during training: ' + str(e) + '\n' + trc)
+        # Printing this causes the exception to be in the training job logs, as well.
+        print('[INFO] Exception during training: ' + str(e) + '\n' + trc, file=sys.stderr)
+        # A non-zero exit code causes the training job to be marked as Failed.
+        sys.exit(255)
+
+
+if __name__ == '__main__':
+    train()
+
+    # A zero exit code causes the job to be marked a Succeeded.
+    sys.exit(0)
